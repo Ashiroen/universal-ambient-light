@@ -6,6 +6,11 @@ import org.junit.Test
 
 class HueEntertainmentClientTest {
 
+    companion object {
+        private const val CONFIG_ID = "6eaf3b98-418d-48f3-89e4-a374cf9ef290"
+    }
+
+
     @Test
     fun `the message starts with the protocol name`() {
         val message = HueEntertainmentClient.message(1)
@@ -53,20 +58,26 @@ class HueEntertainmentClientTest {
 
     @Test
     fun `the v2 protocol version is major 2 minor 0`() {
-        assertArrayEquals(byteArrayOf(2, 0), HueEntertainmentClient.messageV2(1).copyOfRange(9, 11))
+        assertArrayEquals(byteArrayOf(2, 0), HueEntertainmentClient.messageV2(1, CONFIG_ID).copyOfRange(9, 11))
     }
 
     @Test
-    fun `every v2 channel takes seven bytes after the header`() {
-        assertEquals(16 + 3 * 7, HueEntertainmentClient.messageV2(3).size)
+    fun `every v2 channel sits after the 52 byte header`() {
+        assertEquals(52 + 3 * 7, HueEntertainmentClient.messageV2(3, CONFIG_ID).size)
+    }
+
+    @Test
+    fun `the v2 message includes the entertainment configuration id`() {
+        val message = HueEntertainmentClient.messageV2(1, CONFIG_ID)
+        assertEquals(CONFIG_ID, String(message, 16, 36, Charsets.US_ASCII))
     }
 
     @Test
     fun `a v2 channel writes its id and full red`() {
-        val message = HueEntertainmentClient.messageV2(1)
+        val message = HueEntertainmentClient.messageV2(1, CONFIG_ID)
         HueEntertainmentClient.writeChannel(message, 0, 4, 0xFF0000)
-        assertEquals(4, message[16].toInt())
-        assertArrayEquals(byteArrayOf(-1, -1, 0, 0, 0, 0), message.copyOfRange(17, 23))
+        assertEquals(4, message[52].toInt())
+        assertArrayEquals(byteArrayOf(-1, -1, 0, 0, 0, 0), message.copyOfRange(53, 59))
     }
 
     @Test

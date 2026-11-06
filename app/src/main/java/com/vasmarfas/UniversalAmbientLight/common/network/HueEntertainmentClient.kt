@@ -94,7 +94,7 @@ class HueEntertainmentClient(
             setStreamActiveQuietly(false)
             throw IOException("DTLS handshake with the Hue bridge failed: ${e.message}", e)
         }
-        mMessage = if (mV2ConfigId != null) messageV2(mStreamTargets.size) else message(mStreamTargets.size)
+        mMessage = mV2ConfigId?.let { messageV2(mStreamTargets.size, it) } ?: message(mStreamTargets.size)
         mConnected = true
         // Кадр, пришедший раньше срока, уходит здесь: иначе последний цвет сцены терялся бы
         // до следующей смены картинки. Без сообщений десять секунд мост закрывает поток и
@@ -320,6 +320,8 @@ class HueEntertainmentClient(
         private const val KEEPALIVE_MS = 1000L
         private const val HEADER_SIZE = 16
         private const val LIGHT_SIZE = 9
+        private const val V2_ID_SIZE = 36
+        private const val V2_HEADER_SIZE = HEADER_SIZE + V2_ID_SIZE
         private const val V2_CHANNEL_SIZE = 7
         private const val SEQUENCE_OFFSET = 11
 
@@ -345,16 +347,19 @@ class HueEntertainmentClient(
             }
         }
 
-        /** Заголовок HueStream 2.0: каналы градиентной ленты, по 7 байт (номер и RGB). */
-        internal fun messageV2(channels: Int): ByteArray {
-            val message = ByteArray(HEADER_SIZE + channels * V2_CHANNEL_SIZE)
+        /** Заголовок HueStream 2.0: 16 байт плюс ASCII UUID зоны и каналы по 7 байт. */
+        internal fun messageV2(channels: Int, configId: String): ByteArray {
+            val message = ByteArray(V2_HEADER_SIZE + channels * V2_CHANNEL_SIZE)
             "HueStream".toByteArray(Charsets.US_ASCII).copyInto(message)
             message[9] = 0x02
+            val id = configId.toByteArray(Charsets.US_ASCII)
+            val length = minOf(id.size, V2_ID_SIZE)
+            id.copyInto(message, HEADER_SIZE, 0, length)
             return message
         }
 
         internal fun writeChannel(message: ByteArray, index: Int, channelId: Int, rgb: Int) {
-            val offset = HEADER_SIZE + index * V2_CHANNEL_SIZE
+            val offset = V2_HEADER_SIZE + index * V2_CHANNEL_SIZE
             message[offset] = channelId.toByte()
             for (channel in 0 until 3) {
                 val value = ((rgb shr (16 - channel * 8)) and 0xFF) * 257

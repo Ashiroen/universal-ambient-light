@@ -251,9 +251,14 @@ class HueEntertainmentClient(
     @Throws(IOException::class)
     override fun setImage(data: ByteArray, width: Int, height: Int, priority: Int, duration_ms: Int) {
         if (!mConnected || width <= 0 || height <= 0) return
-        val colors = IntArray(mStreamTargets.size) { sample(data, width, height, mStreamTargets[it]) }
-        val output = if (mSmoothGradient() && colors.size > 1) {
-            HueGradientSmoother.apply(mStreamTargets, colors)
+        val viewerFacing = mSmoothGradient()
+        val targets = if (viewerFacing) HueViewerFacingMapper.remap(mStreamTargets) else mStreamTargets
+        val colors = IntArray(targets.size) { index ->
+            if (viewerFacing) sampleEdge(data, width, height, targets[index])
+            else sample(data, width, height, targets[index])
+        }
+        val output = if (viewerFacing && colors.size > 1) {
+            HueGradientSmoother.apply(targets, colors)
         } else {
             colors
         }
@@ -325,24 +330,12 @@ class HueEntertainmentClient(
         val half = maxOf(width, height) / 8
         val cx = (light.u * (width - 1)).toInt()
         val cy = (light.v * (height - 1)).toInt()
-        var r = 0L
-        var g = 0L
-        var b = 0L
-        var count = 0
-        for (y in (cy - half).coerceAtLeast(0)..(cy + half).coerceAtMost(height - 1)) {
-            var i = (y * width + (cx - half).coerceAtLeast(0)) * 3
-            for (x in (cx - half).coerceAtLeast(0)..(cx + half).coerceAtMost(width - 1)) {
-                if (i + 2 >= data.size) break
-                r += data[i].toInt() and 0xFF
-                g += data[i + 1].toInt() and 0xFF
-                b += data[i + 2].toInt() and 0xFF
-                count++
-                i += 3
-            }
-        }
-        if (count == 0) return 0
-        return ((r / count).toInt() shl 16) or ((g / count).toInt() shl 8) or (b / count).toInt()
+        return averageRegion(data, width, height, cx, cy, half, half)
     }
+
+    /** Узкое окно у края кадра: вертикальная лента не смешивает левую и правую половины. */
+    private fun sampleEdge(data: ByteArray, width: Int, height: Int, light: Light): Int =
+        sampleEdge(data, width, height, light.u, light.v)
 
     /**
      * Мосту нужны ровно DTLS 1.2 и PSK с AES-128-GCM; сертификатов у него нет. Шифры даёт
@@ -465,6 +458,51 @@ class HueEntertainmentClient(
             ((x + 1f) / 2f).coerceIn(0f, 1f),
             ((1f - z) / 2f).coerceIn(0f, 1f),
         )
+
+        /**
+         * Viewer-facing edge sample: centre from u*width / v*height so a 2×2
+         * frame still separates left/right at the 0.08 / 0.92 insets, with a
+         * narrow halfX that cannot cross the image centre.
+         */
+        internal fun sampleEdge(data: ByteArray, width: Int, height: Int, u: Float, v: Float): Int {
+            val halfX = width / 32
+            val halfY = height / 8
+            val cx = (u * width).toInt().coerceIn(0, width - 1)
+            val cy = (v * height).toInt().coerceIn(0, height - 1)
+            return averageRegion(data, width, height, cx, cy, halfX, halfY)
+        }
+
+        internal fun averageRegion(
+            data: ByteArray,
+            width: Int,
+            height: Int,
+            cx: Int,
+            cy: Int,
+            halfX: Int,
+            halfY: Int,
+        ): Int {
+            var r = 0L
+            var g = 0L
+            var b = 0L
+            var count = 0
+            val x0 = (cx - halfX).coerceAtLeast(0)
+            val x1 = (cx + halfX).coerceAtMost(width - 1)
+            val y0 = (cy - halfY).coerceAtLeast(0)
+            val y1 = (cy + halfY).coerceAtMost(height - 1)
+            for (y in y0..y1) {
+                var i = (y * width + x0) * 3
+                for (x in x0..x1) {
+                    if (i + 2 >= data.size) break
+                    r += data[i].toInt() and 0xFF
+                    g += data[i + 1].toInt() and 0xFF
+                    b += data[i + 2].toInt() and 0xFF
+                    count++
+                    i += 3
+                }
+            }
+            if (count == 0) return 0
+            return ((r / count).toInt() shl 16) or ((g / count).toInt() shl 8) or (b / count).toInt()
+        }
 
         internal fun hexToBytes(hex: String): ByteArray {
             val clean = hex.trim()

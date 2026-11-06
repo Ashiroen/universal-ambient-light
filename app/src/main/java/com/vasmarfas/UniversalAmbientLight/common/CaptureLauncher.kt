@@ -42,7 +42,13 @@ object CaptureLauncher {
 
         val prefs = Preferences(app)
         prefs.putBoolean(R.string.pref_key_lighting_was_active, true)
-        if (ScreenGrabberService.sInstanceRunning) return Result(Outcome.STARTED)
+        // Живой сервис ≠ идущий захват: после сна ТВ Hue может остаться на связи, а
+        // MediaProjection уже отозвана. Тогда не считаем старт успешным — ниже снова
+        // уйдём в BootActivity за новым согласием, не вызывая stop() (он сбросил бы
+        // lighting_was_active и отключил автозапуск).
+        if (ScreenGrabberService.sInstanceRunning && ScreenGrabberService.sIsCapturing) {
+            return Result(Outcome.STARTED)
+        }
 
         val source = prefs.getString(R.string.pref_key_capture_source, "screen") ?: "screen"
         if (source == "camera") {

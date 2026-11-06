@@ -78,6 +78,9 @@ class ScreenGrabberService : Service() {
     private var mConnectionType = "hyperion"
     private var mProjectionResultCode: Int? = null
     private var mProjectionDataExtras: android.os.Bundle? = null
+    // После отзыва MediaProjection на сне ТВ согласие нельзя переиспользовать — один
+    // запрос нового диалога на пробуждение, без повторных BootActivity от SCREEN_ON.
+    @Volatile private var mFreshCaptureRequested = false
 
     // Хранит AppOptions, отданные активному энкодеру: правки цветовых настроек по ходу
     // захвата подставляются сюда, не перезапуская сессию.
@@ -281,6 +284,7 @@ class ScreenGrabberService : Service() {
                     }
 
                     if (!isCapturing) {
+                        sIsCapturing = false
                         val backend = mActiveBackend
                         if (backend != null) {
                             if (DEBUG) Log.v(TAG, "Resuming ${backend.javaClass.simpleName}")
@@ -612,49 +616,100 @@ class ScreenGrabberService : Service() {
             val action = intent.action
             if (DEBUG) Log.v(TAG, "Start command action: " + action.toString())
             when (action) {
-                ACTION_START -> if (mHyperionThread == null) {
-                    mStartInProgress = true
-                    mHasConnected = false
-                    mEverConnected = false
-                    notifyActivity()
-                    mCaptureSource = "screen"
-                    val prefs = Preferences(this)
-                    val method =
-                        prefs.getString(R.string.pref_key_capture_method, "media_projection")
-                            ?: "media_projection"
+                ACTION_START -> {
+                    val hasFreshProjection =
+                        intent.hasExtra(EXTRA_RESULT_CODE) || intent.hasExtra(EXTRA_RESULT_DATA)
+                    if (mHyperionThread == null) {
+                        mStartInProgress = true
+                        mHasConnected = false
+                        mEverConnected = false
+                        notifyActivity()
+                        mCaptureSource = "screen"
+                        val prefs = Preferences(this)
+                        val method =
+                            prefs.getString(R.string.pref_key_capture_method, "media_projection")
+                                ?: "media_projection"
 
-                    val useMediaProjection = method == "media_projection"
-                    val foregroundType = if (useMediaProjection)
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                    else
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                        val useMediaProjection = method == "media_projection"
+                        val foregroundType = if (useMediaProjection)
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                        else
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
 
-                    if (!tryStartForegroundCompat(foregroundType)) return stopWithoutForeground()
+                        if (!tryStartForegroundCompat(foregroundType)) return stopWithoutForeground()
 
-                    val isPrepared = prepared()
-                    if (isPrepared) {
-                        if (useMediaProjection) {
-                            try {
-                                startScreenRecord(intent)
-                            } catch (e: SecurityException) {
-                                Log.e(TAG, "Failed to start screen recording: " + e.message)
-                                mStartError =
-                                    resources.getString(R.string.error_media_projection_denied)
-                                AnalyticsHelper.logServiceError(
-                                    baseContext,
-                                    "security_exception",
-                                    e.message
-                                )
-                                haltStartup()
-                                return START_STICKY
+                        val isPrepared = prepared()
+                        if (isPrepared) {
+                            if (useMediaProjection) {
+                                try {
+                                    startScreenRecord(intent)
+                                    mFreshCaptureRequested = false
+                                } catch (e: SecurityException) {
+                                    Log.e(TAG, "Failed to start screen recording: " + e.message)
+                                    mStartError =
+                                        resources.getString(R.string.error_media_projection_denied)
+                                    AnalyticsHelper.logServiceError(
+                                        baseContext,
+                                        "security_exception",
+                                        e.message
+                                    )
+                                    haltStartup()
+                                    return START_STICKY
+                                }
+                            } else {
+                                startAlternativeRecord(method)
                             }
-                        } else {
-                            startAlternativeRecord(method)
-                        }
 
-                        registerEventReceiver()
-                    } else {
-                        haltStartup()
+                            registerEventReceiver()
+                        } else {
+                            haltStartup()
+                        }
+                    } else if (hasFreshProjection && !isCapturing) {
+                        // Сервис жив (Hue/Hyperion подключены), но захват после сна ТВ
+                        // мёртв — подставляем новое согласие MediaProjection без разрыва вывода.
+                        Log.i(TAG, "Applying fresh MediaProjection to the running session")
+                        mStartInProgress = true
+                        mCaptureSource = "screen"
+                        mStartError = null
+                        notifyActivity()
+                        if (!tryStartForegroundCompat(
+                                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                            )
+                        ) {
+                            return stopWithoutForeground()
+                        }
+                        try {
+                            try {
+                                (mActiveBackend as? ScreenEncoder)?.stopRecordingNoDisconnect()
+                            } catch (e: Exception) {
+                                Log.w(
+                                    TAG,
+                                    "Failed to stop previous encoder before fresh projection",
+                                    e
+                                )
+                            }
+                            mActiveBackend = null
+                            startScreenRecord(intent)
+                            mFreshCaptureRequested = false
+                        } catch (e: SecurityException) {
+                            Log.e(TAG, "Failed to apply fresh MediaProjection: " + e.message)
+                            mStartError =
+                                resources.getString(R.string.error_media_projection_denied)
+                            AnalyticsHelper.logServiceError(
+                                baseContext,
+                                "security_exception",
+                                e.message
+                            )
+                            mStartInProgress = false
+                            notifyActivity()
+                            requestFreshCapture()
+                        }
+                    } else if (DEBUG) {
+                        Log.v(
+                            TAG,
+                            "Ignoring ACTION_START: thread running, capturing=$isCapturing, " +
+                                "hasFreshProjection=$hasFreshProjection"
+                        )
                     }
                 }
 
@@ -800,6 +855,20 @@ class ScreenGrabberService : Service() {
                     if (mHyperionThread == null) stopSelf()
                 }
 
+                ACTION_CAPTURE_DENIED -> {
+                    // Отказ в диалоге MediaProjection при уже живом сервисе (пробуждение ТВ):
+                    // сбрасываем ожидание, сервис и вывод не трогаем — lighting_was_active
+                    // уже сбросил BootActivity.
+                    mFreshCaptureRequested = false
+                    mStartInProgress = false
+                    if (mStartError == null) {
+                        mStartError =
+                            resources.getString(R.string.error_media_projection_denied)
+                    }
+                    notifyActivity()
+                    if (mHyperionThread == null) stopSelf()
+                }
+
                 ACTION_EXIT -> {
                     // «Выход» из уведомления, плитки и ярлыка — решение пользователя: автозапуск
                     // и сторож больше не должны поднимать подсветку
@@ -838,6 +907,8 @@ class ScreenGrabberService : Service() {
         mForegroundStarted = false
         notifyActivity()
         sInstanceRunning = false
+        sIsCapturing = false
+        mFreshCaptureRequested = false
 
         super.onDestroy()
     }
@@ -1387,10 +1458,22 @@ class ScreenGrabberService : Service() {
             screencap.resumeRecording()
             return
         }
-        val resultCode = mProjectionResultCode ?: return
-        val projectionIntent = buildProjectionDataIntent() ?: return
-        val projectionManager = mMediaProjectionManager ?: return
-        val thread = mHyperionThread ?: return
+        val resultCode = mProjectionResultCode
+        val projectionIntent = buildProjectionDataIntent()
+        val projectionManager = mMediaProjectionManager
+        val thread = mHyperionThread
+        if (resultCode == null || projectionIntent == null ||
+            projectionManager == null || thread == null
+        ) {
+            Log.w(
+                TAG,
+                "Cannot restart encoder from saved projection " +
+                    "(code=${resultCode != null}, extras=${projectionIntent != null}, " +
+                    "mgr=${projectionManager != null}, thread=${thread != null})"
+            )
+            requestFreshCapture()
+            return
+        }
 
         // Останавливаем старый энкодер без разрыва соединения (важно для keepalive WLED)
         try {
@@ -1401,6 +1484,7 @@ class ScreenGrabberService : Service() {
             Log.w(TAG, "Failed to stop the previous encoder before restart", e)
         }
         mActiveBackend = null
+        sIsCapturing = false
 
         releaseResource()
 
@@ -1408,6 +1492,12 @@ class ScreenGrabberService : Service() {
             val projection = projectionManager.getMediaProjection(resultCode, projectionIntent)
             val window = getSystemService(WINDOW_SERVICE) as? WindowManager
             if (projection == null || window == null) {
+                Log.w(
+                    TAG,
+                    "getMediaProjection/window null while restarting encoder; " +
+                        "requesting a fresh capture"
+                )
+                requestFreshCapture()
                 return
             }
 
@@ -1427,26 +1517,72 @@ class ScreenGrabberService : Service() {
                 options
             )
             mActiveBackend = encoder
+            mFreshCaptureRequested = false
             encoder.sendStatus()
         } catch (e: Exception) {
             // Токен MediaProjection мог истечь или быть отозван системой; на Android 14+
             // повторное использование согласия запрещено и бросает SecurityException (часть
-            // прошивок — IllegalStateException). Падать из приёмника широковещаний нельзя —
-            // сообщаем об ошибке и останавливаемся, иначе сервис навсегда завис бы в
-            // foreground без захвата.
+            // прошивок — IllegalStateException). Сервис не останавливаем: Hue/Hyperion
+            // остаются на связи, а новое согласие запрашиваем как при ручном включении —
+            // с PROJECT_MEDIA через ADB диалог подтверждается сам.
             Log.e(TAG, "Failed to restart encoder from saved projection: ${e.message}", e)
             mStartError = resources.getString(R.string.error_media_projection_denied)
             mProjectionResultCode = null
             mProjectionDataExtras = null
             releaseResource()
             notifyActivity()
-            stopSelf()
-            // Старое согласие не годится — просим новое тем же путём, что и при включении ТВ:
-            // с выданным через ADB PROJECT_MEDIA диалог подтверждается сам
-            if (AutoStart.shouldResume(this)) {
-                val app = applicationContext
-                mHandler?.postDelayed({ AutoStart.resume(app) }, SESSION_RESTART_DELAY_MS)
+            requestFreshCapture()
+        }
+    }
+
+    /**
+     * Старое согласие MediaProjection после сна ТВ нельзя переиспользовать. Не вызываем
+     * [CaptureLauncher.stop]: он сбрасывает lighting_was_active и отключает автозапуск.
+     * Оставляем вывод (Hue/Hyperion) и просим новое согласие через [BootActivity], как
+     * ручное включение; [ACTION_START] с свежими extras подставит проекцию в живой сервис.
+     */
+    private fun requestFreshCapture() {
+        if (!AutoStart.shouldResume(this)) {
+            Log.i(TAG, "Not requesting fresh capture: autostart/resume disabled")
+            mFreshCaptureRequested = false
+            return
+        }
+        if (mFreshCaptureRequested) {
+            Log.i(TAG, "Fresh MediaProjection already requested; waiting")
+            return
+        }
+        mFreshCaptureRequested = true
+        mProjectionResultCode = null
+        mProjectionDataExtras = null
+        try {
+            (mActiveBackend as? ScreenEncoder)?.stopRecordingNoDisconnect()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to stop encoder before fresh capture request", e)
+        }
+        mActiveBackend = null
+        sIsCapturing = false
+        releaseResource()
+        mStartInProgress = true
+        mStartError = null
+        notifyActivity()
+        Log.i(TAG, "Requesting a fresh MediaProjection via CaptureLauncher/BootActivity")
+        val app = applicationContext
+        val launch = Runnable {
+            val result = CaptureLauncher.start(app)
+            if (result.outcome == CaptureLauncher.Outcome.FAILED) {
+                Log.w(TAG, "Fresh capture request failed: ${result.message}")
+                mFreshCaptureRequested = false
+                mStartInProgress = false
+                mStartError = result.message
+                notifyActivity()
             }
+        }
+        // С главного looper'а: из SCREEN_ON-приёмника startActivity надёжнее на следующем тике
+        val handler = mHandler
+        if (handler != null) {
+            handler.post(launch)
+        } else {
+            launch.run()
         }
     }
 
@@ -1492,6 +1628,7 @@ class ScreenGrabberService : Service() {
         get() = isCapturing && mHasConnected
 
     private fun notifyActivity() {
+        sIsCapturing = isCapturing
         // RUNNING означает готовность источника и основного вывода.
         val communicating = isCommunicating
         if (communicating) mStartInProgress = false
@@ -1809,6 +1946,7 @@ class ScreenGrabberService : Service() {
         const val CALIBRATION_BEGIN = "begin"
         const val CALIBRATION_END = "end"
         const val CALIBRATION_DARK = "dark"
+        const val ACTION_CAPTURE_DENIED = BASE + "ACTION_CAPTURE_DENIED"
         const val ACTION_EXIT = BASE + "ACTION_EXIT"
         const val GET_STATUS = BASE + "ACTION_STATUS"
         const val EXTRA_RESULT_CODE = BASE + "EXTRA_RESULT_CODE"
@@ -2025,6 +2163,15 @@ class ScreenGrabberService : Service() {
         @Volatile
         @JvmStatic
         var sInstanceRunning: Boolean = false
+            internal set
+
+        /**
+         * True, пока активный бэкенд реально захватывает кадры.
+         * Сервис может быть жив (Hue подключён) и при этом не захватывать — после сна ТВ.
+         */
+        @Volatile
+        @JvmStatic
+        var sIsCapturing: Boolean = false
             internal set
     }
 }

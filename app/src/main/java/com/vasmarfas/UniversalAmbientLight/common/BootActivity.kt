@@ -183,6 +183,17 @@ class BootActivity : AppCompatActivity() {
                     this,
                     getString(R.string.error_media_projection_denied)
                 )
+                // Если сервис уже жил без захвата (пробуждение ТВ), сбрасываем его
+                // ожидание нового согласия — иначе mFreshCaptureRequested залипнет
+                if (ScreenGrabberService.sInstanceRunning) {
+                    val denied = Intent(this, ScreenGrabberService::class.java)
+                    denied.action = ScreenGrabberService.ACTION_CAPTURE_DENIED
+                    try {
+                        startService(denied)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Could not notify service of projection denial: ${e.message}")
+                    }
+                }
             }
             finish()
         }

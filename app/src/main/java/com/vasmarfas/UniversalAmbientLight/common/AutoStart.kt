@@ -59,13 +59,22 @@ object AutoStart {
         val power = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val standby = power?.isInteractive == false
         scheduleWatchdog(context, if (standby) STANDBY_WATCHDOG_INTERVAL_MS else WATCHDOG_INTERVAL_MS)
-        if (standby || ScreenGrabberService.sInstanceRunning) return
-        Log.i(TAG, "Watchdog: capture service is gone, resuming")
+        // Сервис может быть жив без захвата (отозванная MediaProjection после сна) —
+        // тогда тоже поднимаем захват заново.
+        if (standby) return
+        if (ScreenGrabberService.sInstanceRunning && ScreenGrabberService.sIsCapturing) return
+        Log.i(
+            TAG,
+            "Watchdog: capture not active " +
+                "(running=${ScreenGrabberService.sInstanceRunning}, " +
+                "capturing=${ScreenGrabberService.sIsCapturing}), resuming"
+        )
         resume(context)
     }
 
     fun resume(context: Context): CaptureLauncher.Result? {
-        if (!shouldResume(context) || ScreenGrabberService.sInstanceRunning) return null
+        if (!shouldResume(context)) return null
+        if (ScreenGrabberService.sInstanceRunning && ScreenGrabberService.sIsCapturing) return null
         val result = CaptureLauncher.start(context)
         if (result.outcome == CaptureLauncher.Outcome.FAILED) {
             Log.w(TAG, "Auto start failed: ${result.message}")

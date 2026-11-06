@@ -44,13 +44,14 @@ class HueEntertainmentClient(
     private val mBase = "http://$mHost/api/${mUsername.trim()}"
     private var mLights: List<Light> = emptyList()
     private var mStreamTargets: List<Light> = emptyList()
+    @Volatile
     private var mV2ConfigId: String? = null
-    private var mSocket: DatagramSocket? = null
-    private var mTransport: DTLSTransport? = null
+    private var mStream: HueStreamSession? = null
     private var mMessage = ByteArray(0)
     private var mSequence = 0
     private var mDirty = false
     private val mTicker = Executors.newSingleThreadScheduledExecutor { Thread(it, "hue-stream-ticker") }
+    private val mWatchdog = Executors.newSingleThreadScheduledExecutor { Thread(it, "hue-stream-watchdog") }
 
     @Volatile
     private var mLastSendMs = 0L
@@ -85,17 +86,11 @@ class HueEntertainmentClient(
             mStreamTargets = mLights
             setStreamActive(true)
         }
-        try {
-            val socket = DatagramSocket()
-            socket.connect(InetAddress.getByName(mHost), STREAM_PORT)
-            mSocket = socket
-            mTransport = DTLSClientProtocol().connect(PskClient(mUsername.trim(), hexToBytes(mClientKey)), UDPTransport(socket, MTU))
-        } catch (e: IOException) {
-            closeTransport()
-            setStreamActiveQuietly(false)
-            throw IOException("DTLS handshake with the Hue bridge failed: ${e.message}", e)
-        }
+        val link = handshake()
         mMessage = mV2ConfigId?.let { messageV2(mStreamTargets.size, it) } ?: message(mStreamTargets.size)
+        // Отправка или мост могут оборвать поток в любой момент; сессия поднимает его сама,
+        // клиент для HyperionThread остаётся подключённым
+        mStream = HueStreamSession(Bridge(), mWatchdog).also { it.start(link) }
         mConnected = true
         // Кадр, пришедший раньше срока, уходит здесь: иначе последний цвет сцены терялся бы
         // до следующей смены картинки. Без сообщений десять секунд мост закрывает поток и
@@ -103,14 +98,65 @@ class HueEntertainmentClient(
         mTicker.scheduleWithFixedDelay({
             val idle = System.currentTimeMillis() - mLastSendMs
             if (idle >= KEEPALIVE_MS || idle >= FRAME_INTERVAL_MS && isDirty()) {
-                try {
-                    send()
-                } catch (e: IOException) {
-                    Log.w(TAG, "Hue stream send failed: ${e.message}")
-                }
+                send()
             }
         }, FRAME_INTERVAL_MS, FRAME_INTERVAL_MS, TimeUnit.MILLISECONDS)
         Log.i(TAG, "Hue entertainment stream to ${mStreamTargets.size} ${if (mV2ConfigId != null) "v2 channels" else "lights"}")
+    }
+
+    /** DTLS к порту 2100 после того, как поток включён; при ошибке поток выключается. */
+    @Throws(IOException::class)
+    private fun handshake(): HueStreamSession.Link {
+        var socket: DatagramSocket? = null
+        try {
+            socket = DatagramSocket()
+            socket.connect(InetAddress.getByName(mHost), STREAM_PORT)
+            val transport = DTLSClientProtocol().connect(
+                PskClient(mUsername.trim(), hexToBytes(mClientKey)),
+                UDPTransport(socket, MTU),
+            )
+            return DtlsLink(socket, transport)
+        } catch (e: IOException) {
+            socket?.close()
+            setStreamActiveQuietly(false)
+            throw IOException("DTLS handshake with the Hue bridge failed: ${e.message}", e)
+        }
+    }
+
+    private class DtlsLink(private val socket: DatagramSocket, private val transport: DTLSTransport) :
+        HueStreamSession.Link {
+        override fun send(data: ByteArray) = transport.send(data, 0, data.size)
+
+        override fun close() {
+            try {
+                transport.close()
+            } catch (e: IOException) {
+                Log.w(TAG, "DTLS close failed: ${e.message}")
+            }
+            socket.close()
+        }
+    }
+
+    private inner class Bridge : HueStreamSession.Bridge {
+        override fun open(): HueStreamSession.Link {
+            setStreamActive(true)
+            return handshake()
+        }
+
+        override fun stop() = setStreamActiveQuietly(false)
+
+        override fun isActive(): Boolean? {
+            val configId = mV2ConfigId
+            return if (configId != null) {
+                parseV2StreamActive(
+                    HueClient.requestV2(
+                        "GET", mHost, mUsername, "/clip/v2/resource/entertainment_configuration/$configId", null,
+                    )
+                )
+            } else {
+                parseV1StreamActive(HueClient.request("GET", "$mBase/groups/$mAreaId", null))
+            }
+        }
     }
 
     @Throws(IOException::class)
@@ -156,16 +202,11 @@ class HueEntertainmentClient(
     @Throws(IOException::class)
     override fun disconnect() {
         mTicker.shutdownNow()
-        if (mConnected) {
-            fill { _, _ -> 0 }
-            try {
-                send()
-            } catch (e: IOException) {
-                Log.w(TAG, "Final black message failed: ${e.message}")
-            }
-        }
+        // Перезапуск, который уже подключается, увидит остановку сессии и сам выключит поток
+        mWatchdog.shutdownNow()
+        if (mConnected) fill { _, _ -> 0 }
+        mStream?.shutdown(if (mConnected) nextMessage() else null)
         mConnected = false
-        closeTransport()
         setStreamActiveQuietly(false)
         if (mTurnOffOnStop) {
             for (light in mLights) {
@@ -233,26 +274,25 @@ class HueEntertainmentClient(
     @Synchronized
     private fun isDirty(): Boolean = mDirty
 
+    /**
+     * Ошибку записи сессия забирает себе и перезапускает поток. Наружу она не уходит: иначе
+     * HyperionThread создал бы новый клиент и затем выключил бы поток старым (тот же поток).
+     * Пока поток поднимается, кадр остаётся «грязным» и уходит первым же тиком после.
+     */
     @Synchronized
-    @Throws(IOException::class)
     private fun send() {
-        val transport = mTransport ?: return
-        mMessage[SEQUENCE_OFFSET] = mSequence.toByte()
-        mSequence = (mSequence + 1) and 0xFF
-        transport.send(mMessage, 0, mMessage.size)
-        mDirty = false
-        mLastSendMs = System.currentTimeMillis()
+        val stream = mStream ?: return
+        if (stream.send(nextMessage())) {
+            mDirty = false
+            mLastSendMs = System.currentTimeMillis()
+        }
     }
 
-    private fun closeTransport() {
-        try {
-            mTransport?.close()
-        } catch (e: IOException) {
-            Log.w(TAG, "DTLS close failed: ${e.message}")
-        }
-        mTransport = null
-        mSocket?.close()
-        mSocket = null
+    @Synchronized
+    private fun nextMessage(): ByteArray {
+        mMessage[SEQUENCE_OFFSET] = mSequence.toByte()
+        mSequence = (mSequence + 1) and 0xFF
+        return mMessage
     }
 
     @Throws(IOException::class)
@@ -395,6 +435,26 @@ class HueEntertainmentClient(
                 return id to lights
             }
             return null
+        }
+
+        /** status из CLIP v2 entertainment_configuration; null, если ответ не про это. */
+        internal fun parseV2StreamActive(reply: String): Boolean? = try {
+            val config = JSONObject(reply).optJSONArray("data")?.optJSONObject(0)
+            when (config?.optString("status")) {
+                "active" -> true
+                "inactive" -> false
+                else -> null
+            }
+        } catch (e: JSONException) {
+            null
+        }
+
+        /** stream.active группы v1; null, если поля нет. */
+        internal fun parseV1StreamActive(reply: String): Boolean? = try {
+            val stream = JSONObject(reply).optJSONObject("stream")
+            if (stream == null || !stream.has("active")) null else stream.optBoolean("active")
+        } catch (e: JSONException) {
+            null
         }
 
         private fun matchesArea(idV1: String, id: String, areaId: String): Boolean =

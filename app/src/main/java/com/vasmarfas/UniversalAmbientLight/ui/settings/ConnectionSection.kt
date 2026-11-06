@@ -244,6 +244,15 @@ internal fun ColumnScope.ConnectionSection(
                     )
                     CheckBoxPreference(
                         prefs = prefs,
+                        keyRes = R.string.pref_key_hue_viewer_gradient,
+                        title = stringResource(R.string.pref_title_hue_viewer_gradient),
+                        summary = stringResource(R.string.pref_summary_hue_viewer_gradient),
+                        onValueChange = {
+                            AnalyticsHelper.logSettingChanged(context, "hue_viewer_gradient", it.toString())
+                        }
+                    )
+                    CheckBoxPreference(
+                        prefs = prefs,
                         keyRes = R.string.pref_key_ha_turn_off_lights,
                         title = stringResource(R.string.pref_title_ha_turn_off_lights),
                         summary = stringResource(R.string.pref_summary_ha_turn_off_lights),

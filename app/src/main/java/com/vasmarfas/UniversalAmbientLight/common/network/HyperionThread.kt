@@ -2,6 +2,7 @@ package com.vasmarfas.UniversalAmbientLight.common.network
 
 import android.content.Context
 import android.util.Log
+import com.vasmarfas.UniversalAmbientLight.R
 import com.vasmarfas.UniversalAmbientLight.common.ScreenGrabberService
 import com.vasmarfas.UniversalAmbientLight.common.util.AnalyticsHelper
 import com.vasmarfas.UniversalAmbientLight.common.util.Preferences
@@ -521,7 +522,7 @@ class HyperionThread(
             OutputType.HUE -> if (mConfig.hueArea.isNotBlank()) {
                 HueEntertainmentClient(
                     host, mConfig.hueUsername, mConfig.hueClientKey, mConfig.hueArea, mConfig.haTurnOffLights
-                )
+                ) { mPrefs.getBoolean(R.string.pref_key_hue_viewer_gradient) }
             } else {
                 HueClient(host, mConfig.hueUsername, mConfig.lamps, lampSettings())
             }

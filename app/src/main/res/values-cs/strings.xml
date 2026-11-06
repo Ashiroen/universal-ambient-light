@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <resources>
   <!-- Strings related to guided sequence activity -->
+  <string name="pref_title_hue_viewer_gradient">Plynulý přechod (pohled zepředu)</string>
+  <string name="pref_summary_hue_viewer_gradient">Sousední segmenty OmniGlow sjednotí do plynulého přechodu barvy a jasu. Každý segment dál bere barvu ze svého místa na obrazovce.</string>
 </resources>

@@ -35,6 +35,7 @@ class HueEntertainmentClient(
     private val mClientKey: String,
     private val mAreaId: String,
     private val mTurnOffOnStop: Boolean,
+    private val mSmoothGradient: () -> Boolean = { false },
 ) : HyperionClient {
 
     internal class Light(val id: Int, val u: Float, val v: Float)
@@ -156,7 +157,7 @@ class HueEntertainmentClient(
     override fun disconnect() {
         mTicker.shutdownNow()
         if (mConnected) {
-            fill { 0 }
+            fill { _, _ -> 0 }
             try {
                 send()
             } catch (e: IOException) {
@@ -180,7 +181,7 @@ class HueEntertainmentClient(
     @Throws(IOException::class)
     override fun clear(priority: Int) {
         if (!mConnected) return
-        fill { 0 }
+        fill { _, _ -> 0 }
         send()
     }
 
@@ -197,7 +198,7 @@ class HueEntertainmentClient(
     @Throws(IOException::class)
     override fun setColor(color: Int, priority: Int, duration_ms: Int) {
         if (!mConnected) return
-        fill { color and 0xFFFFFF }
+        fill { _, _ -> color and 0xFFFFFF }
         send()
     }
 
@@ -209,16 +210,22 @@ class HueEntertainmentClient(
     @Throws(IOException::class)
     override fun setImage(data: ByteArray, width: Int, height: Int, priority: Int, duration_ms: Int) {
         if (!mConnected || width <= 0 || height <= 0) return
-        fill { light -> sample(data, width, height, light) }
+        val colors = IntArray(mStreamTargets.size) { sample(data, width, height, mStreamTargets[it]) }
+        val output = if (mSmoothGradient() && colors.size > 1) {
+            HueGradientSmoother.apply(mStreamTargets, colors)
+        } else {
+            colors
+        }
+        fill { index, _ -> output[index] }
         if (System.currentTimeMillis() - mLastSendMs >= FRAME_INTERVAL_MS) send()
     }
 
     @Synchronized
-    private fun fill(colorOf: (Light) -> Int) {
+    private fun fill(colorOf: (Int, Light) -> Int) {
         val v2 = mV2ConfigId != null
         for ((index, light) in mStreamTargets.withIndex()) {
-            if (v2) writeChannel(mMessage, index, light.id, colorOf(light))
-            else writeLight(mMessage, index, light.id, colorOf(light))
+            if (v2) writeChannel(mMessage, index, light.id, colorOf(index, light))
+            else writeLight(mMessage, index, light.id, colorOf(index, light))
         }
         mDirty = true
     }

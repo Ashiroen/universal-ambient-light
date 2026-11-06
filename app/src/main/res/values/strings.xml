@@ -863,6 +863,8 @@
   <string name="error_hue_no_clientkey">The Hue bridge has to be paired again: the entertainment area needs a streaming key. Open Settings, Connection.</string>
   <string name="home_setup_hue_repair">The Hue bridge has to be paired again</string>
   <string name="hue_area_loading">Asking the bridge…</string>
+  <string name="pref_title_hue_viewer_gradient">Viewer-facing gradient</string>
+  <string name="pref_summary_hue_viewer_gradient">Blend neighbouring OmniGlow segments into a continuous colour and brightness ramp. Each segment still follows its part of the screen.</string>
 
   <!-- Zigbee2MQTT -->
   <string name="output_z2m">Zigbee2MQTT</string>

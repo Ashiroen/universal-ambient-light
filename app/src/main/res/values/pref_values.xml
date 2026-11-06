@@ -127,6 +127,8 @@
     <string name="pref_key_hue_clientkey" translatable="false">pref_key_hue_clientkey</string>
     <string name="pref_key_hue_area" translatable="false">pref_key_hue_area</string>
     <string name="pref_key_hue_area_name" translatable="false">pref_key_hue_area_name</string>
+    <string name="pref_key_hue_viewer_gradient" translatable="false">pref_key_hue_viewer_gradient</string>
+    <bool name="pref_default_hue_viewer_gradient" translatable="false">true</bool>
 
     <!-- Брокер MQTT для Zigbee2MQTT; адрес и порт общие с остальными контроллерами -->
     <string name="pref_key_mqtt_username" translatable="false">pref_key_mqtt_username</string>

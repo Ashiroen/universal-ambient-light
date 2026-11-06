@@ -4,8 +4,20 @@ import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
+import java.net.ConnectException
 import java.net.HttpURLConnection
+import java.net.NoRouteToHostException
+import java.net.SocketTimeoutException
+import java.net.URI
 import java.net.URL
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLException
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.X509TrustManager
 import kotlin.math.pow
 
 /**
@@ -223,10 +235,43 @@ class HueClient(
             reply.take(120)
         }
 
+        /**
+         * Hue Bridge Pro (и новая прошивка) отвечает на HTTP кодом 301 и шлёт на HTTPS.
+         * [HttpURLConnection] для POST такое перенаправление не повторяет, из-за этого
+         * приложение показывало «HTTP 301». Сначала пробуем HTTPS; на старых мостах
+         * без него остаётся HTTP. Сертификат моста выписан на его ID, а не на IP,
+         * поэтому проверку имени отключаем только для этого соединения.
+         */
         @Throws(IOException::class)
         internal fun request(method: String, url: String, body: String?): String {
-            val connection = URL(url).openConnection() as HttpURLConnection
+            val httpsUrl = toHttps(url)
+            return try {
+                exchange(method, httpsUrl, body, 0)
+            } catch (e: IOException) {
+                if (httpsUrl != url && isUnreachable(e)) exchange(method, url, body, 0) else throw e
+            }
+        }
+
+        internal fun toHttps(url: String): String =
+            if (url.startsWith("http://", ignoreCase = true)) "https://${url.substring(7)}" else url
+
+        private fun isUnreachable(error: IOException): Boolean {
+            var cur: Throwable? = error
+            while (cur != null) {
+                if (cur is ConnectException || cur is SocketTimeoutException ||
+                    cur is NoRouteToHostException || cur is SSLException
+                ) return true
+                cur = cur.cause
+            }
+            return false
+        }
+
+        @Throws(IOException::class)
+        private fun exchange(method: String, url: String, body: String?, hop: Int): String {
+            if (hop > 4) throw IOException("Too many redirects from the Hue bridge")
+            val connection = openConnection(url)
             try {
+                connection.instanceFollowRedirects = false
                 connection.requestMethod = method
                 connection.connectTimeout = CONNECT_TIMEOUT_MS
                 connection.readTimeout = READ_TIMEOUT_MS
@@ -236,6 +281,15 @@ class HueClient(
                     connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
                 }
                 val code = connection.responseCode
+                if (code in REDIRECT_CODES) {
+                    val location = connection.getHeaderField("Location")
+                        ?: throw IOException("HTTP $code from the Hue bridge")
+                    val next = resolveRedirect(url, location)
+                    // 303 переходит на GET; 301 у Hue Bridge Pro — это переход на HTTPS с тем же запросом.
+                    val nextMethod = if (code == HttpURLConnection.HTTP_SEE_OTHER) "GET" else method
+                    val nextBody = if (code == HttpURLConnection.HTTP_SEE_OTHER) null else body
+                    return exchange(nextMethod, next, nextBody, hop + 1)
+                }
                 val stream = if (code in 200..299) connection.inputStream else connection.errorStream
                 val text = stream?.use { it.readBytes().toString(Charsets.UTF_8) }.orEmpty()
                 if (code !in 200..299) throw IOException("HTTP $code from the Hue bridge")
@@ -244,5 +298,38 @@ class HueClient(
                 connection.disconnect()
             }
         }
+
+        private fun openConnection(url: String): HttpURLConnection {
+            val connection = URL(url).openConnection() as HttpURLConnection
+            if (connection is HttpsURLConnection) {
+                connection.sslSocketFactory = hueSslSocketFactory
+                connection.hostnameVerifier = HueHostnameVerifier
+            }
+            return connection
+        }
+
+        private fun resolveRedirect(from: String, location: String): String = try {
+            URI(from).resolve(location).toString()
+        } catch (_: IllegalArgumentException) {
+            location
+        }
+
+        private val hueSslSocketFactory: SSLSocketFactory by lazy {
+            SSLContext.getInstance("TLS").apply {
+                init(null, arrayOf(HueTrustAll), SecureRandom())
+            }.socketFactory
+        }
+
+        private object HueTrustAll : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) = Unit
+            override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) = Unit
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        }
+
+        private object HueHostnameVerifier : HostnameVerifier {
+            override fun verify(hostname: String, session: javax.net.ssl.SSLSession): Boolean = true
+        }
+
+        private val REDIRECT_CODES = setOf(301, 302, 303, 307, 308)
     }
 }

@@ -50,4 +50,36 @@ class HueEntertainmentClientTest {
             HueEntertainmentClient.hexToBytes("0aFF10")
         )
     }
+
+    @Test
+    fun `the v2 protocol version is major 2 minor 0`() {
+        assertArrayEquals(byteArrayOf(2, 0), HueEntertainmentClient.messageV2(1).copyOfRange(9, 11))
+    }
+
+    @Test
+    fun `every v2 channel takes seven bytes after the header`() {
+        assertEquals(16 + 3 * 7, HueEntertainmentClient.messageV2(3).size)
+    }
+
+    @Test
+    fun `a v2 channel writes its id and full red`() {
+        val message = HueEntertainmentClient.messageV2(1)
+        HueEntertainmentClient.writeChannel(message, 0, 4, 0xFF0000)
+        assertEquals(4, message[16].toInt())
+        assertArrayEquals(byteArrayOf(-1, -1, 0, 0, 0, 0), message.copyOfRange(17, 23))
+    }
+
+    @Test
+    fun `a left floor channel maps to the bottom left of the frame`() {
+        val point = HueEntertainmentClient.screenPoint(-1f, -1f)
+        assertEquals(0f, point[0])
+        assertEquals(1f, point[1])
+    }
+
+    @Test
+    fun `a centre ceiling channel maps to the top centre of the frame`() {
+        val point = HueEntertainmentClient.screenPoint(0f, 1f)
+        assertEquals(0.5f, point[0])
+        assertEquals(0f, point[1])
+    }
 }

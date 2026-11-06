@@ -24,6 +24,10 @@ import java.util.concurrent.TimeUnit
  *
  * Каждая лампа берёт цвет того места кадра, где стоит в зоне: x из настроек зоны идёт слева
  * направо, z снизу вверх (пол, уровень ТВ, потолок). Глубина y на картинку не влияет.
+ *
+ * Градиентные ленты (OmniGlow, Play Gradient) в Entertainment API v1 приходят как одна лампа,
+ * поэтому вся лента заливалась одним цветом. Если мост отдаёт конфигурацию CLIP v2, поток
+ * идёт протоколом HueStream 2.0 и каждый канал/сегмент получает свой цвет.
  */
 class HueEntertainmentClient(
     host: String,
@@ -33,11 +37,13 @@ class HueEntertainmentClient(
     private val mTurnOffOnStop: Boolean,
 ) : HyperionClient {
 
-    private class Light(val id: Int, val u: Float, val v: Float)
+    internal class Light(val id: Int, val u: Float, val v: Float)
 
     private val mHost = host.trim()
     private val mBase = "http://$mHost/api/${mUsername.trim()}"
     private var mLights: List<Light> = emptyList()
+    private var mStreamTargets: List<Light> = emptyList()
+    private var mV2ConfigId: String? = null
     private var mSocket: DatagramSocket? = null
     private var mTransport: DTLSTransport? = null
     private var mMessage = ByteArray(0)
@@ -59,10 +65,25 @@ class HueEntertainmentClient(
     private fun connect() {
         if (mClientKey.isBlank()) throw IOException("The Hue bridge was paired without a streaming key")
         mLights = readArea()
-        if (mLights.isEmpty()) throw IOException("The entertainment area has no lights")
+        val v2 = readV2Channels()
+        if (v2 != null) {
+            mV2ConfigId = v2.first
+            mStreamTargets = v2.second
+        } else {
+            mStreamTargets = mLights
+        }
+        if (mStreamTargets.isEmpty()) throw IOException("The entertainment area has no lights")
         // Выключенную лампу поток не зажигает
         for (light in mLights) HueClient.request("PUT", "$mBase/lights/${light.id}/state", """{"on":true}""")
-        setStreamActive(true)
+        try {
+            setStreamActive(true)
+        } catch (e: IOException) {
+            if (mV2ConfigId == null) throw e
+            Log.w(TAG, "Hue entertainment v2 stream failed, falling back to v1: ${e.message}")
+            mV2ConfigId = null
+            mStreamTargets = mLights
+            setStreamActive(true)
+        }
         try {
             val socket = DatagramSocket()
             socket.connect(InetAddress.getByName(mHost), STREAM_PORT)
@@ -73,7 +94,7 @@ class HueEntertainmentClient(
             setStreamActiveQuietly(false)
             throw IOException("DTLS handshake with the Hue bridge failed: ${e.message}", e)
         }
-        mMessage = message(mLights.size)
+        mMessage = if (mV2ConfigId != null) messageV2(mStreamTargets.size) else message(mStreamTargets.size)
         mConnected = true
         // Кадр, пришедший раньше срока, уходит здесь: иначе последний цвет сцены терялся бы
         // до следующей смены картинки. Без сообщений десять секунд мост закрывает поток и
@@ -88,7 +109,7 @@ class HueEntertainmentClient(
                 }
             }
         }, FRAME_INTERVAL_MS, FRAME_INTERVAL_MS, TimeUnit.MILLISECONDS)
-        Log.i(TAG, "Hue entertainment stream to ${mLights.size} lights")
+        Log.i(TAG, "Hue entertainment stream to ${mStreamTargets.size} ${if (mV2ConfigId != null) "v2 channels" else "lights"}")
     }
 
     @Throws(IOException::class)
@@ -105,8 +126,28 @@ class HueEntertainmentClient(
             val position = locations.optJSONArray(id) ?: return@mapNotNull null
             val x = position.optDouble(0, 0.0).toFloat()
             val z = position.optDouble(2, 0.0).toFloat()
-            Light(id.toIntOrNull() ?: return@mapNotNull null, ((x + 1f) / 2f).coerceIn(0f, 1f), ((1f - z) / 2f).coerceIn(0f, 1f))
+            val point = screenPoint(x, z)
+            Light(id.toIntOrNull() ?: return@mapNotNull null, point[0], point[1])
         }.toList()
+    }
+
+    private fun readV2Channels(): Pair<String, List<Light>>? {
+        return try {
+            val reply = HueClient.requestV2(
+                "GET",
+                mHost,
+                mUsername,
+                "/clip/v2/resource/entertainment_configuration",
+                null,
+            )
+            parseEntertainmentConfiguration(reply, mAreaId)
+        } catch (e: IOException) {
+            Log.w(TAG, "Hue entertainment v2 is unavailable: ${e.message}")
+            null
+        } catch (e: JSONException) {
+            Log.w(TAG, "Hue entertainment v2 reply was unreadable: ${e.message}")
+            null
+        }
     }
 
     override fun isConnected(): Boolean = mConnected
@@ -174,8 +215,10 @@ class HueEntertainmentClient(
 
     @Synchronized
     private fun fill(colorOf: (Light) -> Int) {
-        for ((index, light) in mLights.withIndex()) {
-            writeLight(mMessage, index, light.id, colorOf(light))
+        val v2 = mV2ConfigId != null
+        for ((index, light) in mStreamTargets.withIndex()) {
+            if (v2) writeChannel(mMessage, index, light.id, colorOf(light))
+            else writeLight(mMessage, index, light.id, colorOf(light))
         }
         mDirty = true
     }
@@ -207,7 +250,19 @@ class HueEntertainmentClient(
 
     @Throws(IOException::class)
     private fun setStreamActive(active: Boolean) {
-        HueClient.request("PUT", "$mBase/groups/$mAreaId", """{"stream":{"active":$active}}""")
+        val configId = mV2ConfigId
+        if (configId != null) {
+            val action = if (active) "start" else "stop"
+            HueClient.requestV2(
+                "PUT",
+                mHost,
+                mUsername,
+                "/clip/v2/resource/entertainment_configuration/$configId",
+                """{"action":"$action"}""",
+            )
+        } else {
+            HueClient.request("PUT", "$mBase/groups/$mAreaId", """{"stream":{"active":$active}}""")
+        }
     }
 
     private fun setStreamActiveQuietly(active: Boolean) {
@@ -265,6 +320,7 @@ class HueEntertainmentClient(
         private const val KEEPALIVE_MS = 1000L
         private const val HEADER_SIZE = 16
         private const val LIGHT_SIZE = 9
+        private const val V2_CHANNEL_SIZE = 7
         private const val SEQUENCE_OFFSET = 11
 
         /** Заголовок HueStream 1.0 и место под [lights] ламп, цвета в RGB. */
@@ -288,6 +344,55 @@ class HueEntertainmentClient(
                 message[offset + 4 + channel * 2] = value.toByte()
             }
         }
+
+        /** Заголовок HueStream 2.0: каналы градиентной ленты, по 7 байт (номер и RGB). */
+        internal fun messageV2(channels: Int): ByteArray {
+            val message = ByteArray(HEADER_SIZE + channels * V2_CHANNEL_SIZE)
+            "HueStream".toByteArray(Charsets.US_ASCII).copyInto(message)
+            message[9] = 0x02
+            return message
+        }
+
+        internal fun writeChannel(message: ByteArray, index: Int, channelId: Int, rgb: Int) {
+            val offset = HEADER_SIZE + index * V2_CHANNEL_SIZE
+            message[offset] = channelId.toByte()
+            for (channel in 0 until 3) {
+                val value = ((rgb shr (16 - channel * 8)) and 0xFF) * 257
+                message[offset + 1 + channel * 2] = (value shr 8).toByte()
+                message[offset + 2 + channel * 2] = value.toByte()
+            }
+        }
+
+        internal fun parseEntertainmentConfiguration(reply: String, areaId: String): Pair<String, List<Light>>? {
+            val data = JSONObject(reply).optJSONArray("data") ?: return null
+            for (i in 0 until data.length()) {
+                val config = data.optJSONObject(i) ?: continue
+                val id = config.optString("id")
+                if (id.isEmpty() || !matchesArea(config.optString("id_v1"), id, areaId)) continue
+                val channels = config.optJSONArray("channels") ?: return null
+                val lights = ArrayList<Light>(channels.length())
+                for (j in 0 until channels.length()) {
+                    val channel = channels.optJSONObject(j) ?: continue
+                    val position = channel.optJSONObject("position") ?: continue
+                    val x = position.optDouble("x", 0.0).toFloat()
+                    val z = position.optDouble("z", 0.0).toFloat()
+                    val point = screenPoint(x, z)
+                    lights += Light(channel.optInt("channel_id", j), point[0], point[1])
+                }
+                if (lights.isEmpty()) return null
+                return id to lights
+            }
+            return null
+        }
+
+        private fun matchesArea(idV1: String, id: String, areaId: String): Boolean =
+            id == areaId || idV1 == "/groups/$areaId" || idV1.endsWith("/$areaId")
+
+        /** x zóny (-1 vlevo, 1 vpravo) a z (1 strop, -1 podlaha) na souřadnice snímku 0..1. */
+        internal fun screenPoint(x: Float, z: Float): FloatArray = floatArrayOf(
+            ((x + 1f) / 2f).coerceIn(0f, 1f),
+            ((1f - z) / 2f).coerceIn(0f, 1f),
+        )
 
         internal fun hexToBytes(hex: String): ByteArray {
             val clean = hex.trim()

@@ -243,13 +243,34 @@ class HueClient(
          * поэтому проверку имени отключаем только для этого соединения.
          */
         @Throws(IOException::class)
-        internal fun request(method: String, url: String, body: String?): String {
+        internal fun request(
+            method: String,
+            url: String,
+            body: String?,
+            headers: Map<String, String> = emptyMap(),
+        ): String {
             val httpsUrl = toHttps(url)
             return try {
-                exchange(method, httpsUrl, body, 0)
+                exchange(method, httpsUrl, body, headers, 0)
             } catch (e: IOException) {
-                if (httpsUrl != url && isUnreachable(e)) exchange(method, url, body, 0) else throw e
+                if (httpsUrl != url && isUnreachable(e)) {
+                    exchange(method, url, body, headers, 0)
+                } else {
+                    throw e
+                }
             }
+        }
+
+        /** CLIP v2: HTTPS и заголовок hue-application-key вместо пути /api/<user>/… */
+        @Throws(IOException::class)
+        internal fun requestV2(method: String, host: String, username: String, path: String, body: String?): String {
+            val normalized = if (path.startsWith("/")) path else "/$path"
+            return request(
+                method,
+                "https://${host.trim()}$normalized",
+                body,
+                mapOf("hue-application-key" to username.trim()),
+            )
         }
 
         internal fun toHttps(url: String): String =
@@ -267,7 +288,13 @@ class HueClient(
         }
 
         @Throws(IOException::class)
-        private fun exchange(method: String, url: String, body: String?, hop: Int): String {
+        private fun exchange(
+            method: String,
+            url: String,
+            body: String?,
+            headers: Map<String, String>,
+            hop: Int,
+        ): String {
             if (hop > 4) throw IOException("Too many redirects from the Hue bridge")
             val connection = openConnection(url)
             try {
@@ -275,6 +302,7 @@ class HueClient(
                 connection.requestMethod = method
                 connection.connectTimeout = CONNECT_TIMEOUT_MS
                 connection.readTimeout = READ_TIMEOUT_MS
+                for ((name, value) in headers) connection.setRequestProperty(name, value)
                 if (body != null) {
                     connection.doOutput = true
                     connection.setRequestProperty("Content-Type", "application/json")
@@ -288,7 +316,7 @@ class HueClient(
                     // 303 переходит на GET; 301 у Hue Bridge Pro — это переход на HTTPS с тем же запросом.
                     val nextMethod = if (code == HttpURLConnection.HTTP_SEE_OTHER) "GET" else method
                     val nextBody = if (code == HttpURLConnection.HTTP_SEE_OTHER) null else body
-                    return exchange(nextMethod, next, nextBody, hop + 1)
+                    return exchange(nextMethod, next, nextBody, headers, hop + 1)
                 }
                 val stream = if (code in 200..299) connection.inputStream else connection.errorStream
                 val text = stream?.use { it.readBytes().toString(Charsets.UTF_8) }.orEmpty()
